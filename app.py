@@ -67,7 +67,6 @@ if run:
                     "Title": r.title or r.query,
                     "Release Date": r.release_date or "",
                     "Domestic Box Office": r.domestic_total or "",
-                    "Status": r.status,
                     "BOM URL": r.url or "",
                 }
             )
