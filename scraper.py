@@ -34,14 +34,21 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.boxofficemojo.com"
 SEARCH_URL = BASE_URL + "/search/?q={query}"
 
-# A real browser User-Agent. BOM (like most Amazon-family sites) is more
-# likely to serve normal HTML to something that looks like a browser.
+# A full, real-looking browser header set. BOM (like most Amazon-family
+# sites) is more likely to serve the full page - rather than a stripped
+# down version - to something that looks like an actual browser request.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 REQUEST_TIMEOUT = 15   # seconds
@@ -74,8 +81,10 @@ def find_release_url(title: str) -> Optional[tuple]:
     resp = _get(search_url)
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Search results are rows linking to /release/rlXXXXXXXXXX/
-    link = soup.select_one('a[href*="/release/rl"]')
+    # Search results link to a title page - BOM has used both
+    # /title/ttXXXXXXX/ (current, IMDb-ID based) and /release/rlXXXXXXX/
+    # (older format) at different points, so match either.
+    link = soup.select_one('a[href*="/title/tt"], a[href*="/release/rl"]')
     if not link:
         return None
 
@@ -87,25 +96,41 @@ def find_release_url(title: str) -> Optional[tuple]:
     return result_title, href
 
 
-def _extract_summary_field(soup: BeautifulSoup, label: str) -> Optional[str]:
+def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
     """
-    BOM's release page has a right-hand "Summary" block where each fact is
-    a label/value pair, e.g.:
-        <div class="a-section a-spacing-none">
-            <span class="a-size-small">Release Date</span>
-            <span class="a-size-medium">...</span>
-        </div>
-    This walks every summary row, and returns the value next to the given
-    label (case-insensitive, partial match).
+    BOM pages include a breakdown table per region, each preceded by an
+    <h3> heading ("Domestic", "Europe, Middle East, and Africa", etc.):
+
+        <h3>Domestic</h3>
+        <table>
+          <tr><th>Area</th><th>Release Date</th><th>Opening</th><th>Gross</th></tr>
+          <tr><td>Domestic</td><td>Jul 21, 2023</td><td>$82,455,420</td><td>$330,078,895</td></tr>
+        </table>
+
+    This is the authoritative source for both the domestic release date
+    and the domestic lifetime gross, and pulling them from the same row
+    avoids accidentally grabbing an unrelated date (BOM also lists an
+    "Earliest Release Date" elsewhere on the page, which can reflect an
+    international release instead of the domestic one).
     """
-    for row in soup.select("div.mojo-summary-values > div"):
-        spans = row.find_all("span")
-        if len(spans) >= 2:
-            row_label = spans[0].get_text(strip=True)
-            row_value = spans[-1].get_text(" ", strip=True)
-            if label.lower() in row_label.lower():
-                return row_value
-    return None
+    release_date, domestic_total = None, None
+
+    for h3 in soup.find_all("h3"):
+        if h3.get_text(strip=True).lower() != "domestic":
+            continue
+        table = h3.find_next("table")
+        if not table:
+            continue
+        data_row = table.find_all("tr")[1] if len(table.find_all("tr")) > 1 else None
+        if not data_row:
+            continue
+        cells = data_row.find_all("td")
+        if len(cells) >= 4:
+            release_date = cells[1].get_text(" ", strip=True)
+            domestic_total = cells[3].get_text(strip=True)
+        break
+
+    return {"release_date": release_date, "domestic_total": domestic_total}
 
 
 def parse_release_page(html: str) -> dict:
@@ -131,17 +156,18 @@ def parse_release_page(html: str) -> dict:
     if h1:
         title = h1.get_text(strip=True)
 
-    # --- Domestic total ---
-    # The performance summary table at the top of the page lists Domestic /
-    # International / Worldwide totals in that order, each as a span with
-    # class "money".
-    domestic_total = None
-    money_spans = soup.select("span.money")
-    if money_spans:
-        domestic_total = money_spans[0].get_text(strip=True)
+    # --- Release date + Domestic total (pulled from the same table row) ---
+    domestic_row = _extract_domestic_release_row(soup)
+    release_date = domestic_row["release_date"]
+    domestic_total = domestic_row["domestic_total"]
 
-    # --- Release date ---
-    release_date = _extract_summary_field(soup, "Release Date")
+    # Fallback: if the "Domestic" table wasn't found for some reason, fall
+    # back to the top summary money figures (first "money" span is
+    # typically the domestic lifetime total).
+    if domestic_total is None:
+        money_spans = soup.select("span.money")
+        if money_spans:
+            domestic_total = money_spans[0].get_text(strip=True)
 
     return {
         "title": title,
