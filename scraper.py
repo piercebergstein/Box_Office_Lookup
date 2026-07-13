@@ -96,6 +96,39 @@ def find_release_url(title: str) -> Optional[tuple]:
     return result_title, href
 
 
+def _extract_summary_box_domestic_total(soup: BeautifulSoup) -> Optional[str]:
+    """
+    The top-left "All Releases" box on a title page shows Domestic /
+    International / Worldwide totals, e.g.:
+
+        <div class="a-section a-spacing-none">
+            <span class="a-size-small">Domestic (<span class="percent">100%</span>)</span>
+            <br/>
+            <span class="a-size-medium a-text-bold"><span class="money">$953,724</span></span>
+        </div>
+
+    For titles still in theaters, this is the most current domestic total -
+    more current than the per-region breakdown table further down the page,
+    which can lag behind (e.g. showing a stale "Gross" figure) while a film
+    is actively tracking new grosses day to day. This should be tried
+    before falling back to that table.
+    """
+    for div in soup.select("div.a-section.a-spacing-none"):
+        label_span = div.find("span", class_="a-size-small")
+        if not label_span:
+            continue
+        if not label_span.get_text(strip=True).lower().startswith("domestic"):
+            continue
+        value_span = div.find("span", class_="a-size-medium")
+        if not value_span:
+            continue
+        money = value_span.find("span", class_="money")
+        if money:
+            return money.get_text(strip=True)
+        break  # matched the right box but no money span (e.g. "-") - don't keep scanning
+    return None
+
+
 def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
     """
     BOM pages include a breakdown table per region, each preceded by an
@@ -196,10 +229,19 @@ def parse_release_page(html: str) -> dict:
     if h1:
         title = h1.get_text(strip=True)
 
-    # --- Release date + Domestic total (pulled from the same table row) ---
+    # --- Release date + Domestic total ---
     domestic_row = _extract_domestic_release_row(soup)
     release_date = domestic_row["release_date"]
-    domestic_total = domestic_row["domestic_total"]
+
+    # Domestic total priority:
+    #  1. Top "All Releases" summary box - most current, especially for
+    #     titles still actively tracking new box office day to day.
+    #  2. Per-region "Domestic" table's Gross column - can lag behind #1
+    #     for very recent/still-running titles.
+    #  3. First "money" span on the page - last-resort fallback.
+    domestic_total = _extract_summary_box_domestic_total(soup)
+    if domestic_total is None:
+        domestic_total = domestic_row["domestic_total"]
 
     # Fallback 1: older / limited-then-wide titles often lack the clean
     # per-region "Domestic" table above, but have a "By Release" rollout
@@ -207,9 +249,9 @@ def parse_release_page(html: str) -> dict:
     if release_date is None:
         release_date = _extract_by_release_rollout(soup)
 
-    # Fallback 2: if the "Domestic" table wasn't found for some reason, fall
-    # back to the top summary money figures (first "money" span is
-    # typically the domestic lifetime total).
+    # Fallback 2: if nothing above found a domestic total, fall back to the
+    # first "money" span on the page (typically the domestic lifetime
+    # total in the summary table).
     if domestic_total is None:
         money_spans = soup.select("span.money")
         if money_spans:
