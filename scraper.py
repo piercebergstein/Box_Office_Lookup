@@ -80,6 +80,25 @@ def _get(url: str) -> requests.Response:
     return resp
 
 
+def _get_with_retry(url: str, retries: int = 2, backoff: float = 2.0) -> requests.Response:
+    """
+    Same as _get, but retries on failure with increasing delay. Used for
+    the secondary fetches (weekend/daily/release-group pages) that happen
+    after a couple of other requests already went out for the same title -
+    these seem more prone to transient blocks/timeouts than the first
+    request, likely bot-protection reacting to a quick burst of requests.
+    """
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            return _get(url)
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    raise last_error
+
+
 def find_release_url(title: str) -> Optional[tuple]:
     """
     Search Box Office Mojo for a title and return (bom_title, url) for the
@@ -298,32 +317,45 @@ def extract_domestic_date_from_release_group_page(html: str) -> Optional[str]:
 
 def fetch_weekend_summary(release_base_url: str) -> dict:
     """
-    Fetches <release_base_url>weekend/ and returns stats for the most
-    recent weekend on record - determined by picking the row with the
-    highest week number, not by assuming table row order (safer, since
-    BOM's default sort isn't guaranteed):
+    Fetches <release_base_url>weekend/ and returns:
 
-      - weeks_in_theaters: the week-of-release number (e.g. "1", "12")
-      - prev_weekend_gross: that weekend's gross
-      - prev_weekend_theaters: theater count that weekend
-      - prev_weekend_date: the Sunday of that weekend, computed from the
-        page's ISO-week URL encoding (e.g. /weekend/2026W28/) rather than
-        parsed from the "Jul 10-12" display text, which is ambiguous when
-        a weekend spans two months.
+      - weeks_in_theaters, prev_weekend_gross, prev_weekend_theaters,
+        prev_weekend_date: stats for the most recent weekend on record -
+        determined by picking the row with the highest week number, not by
+        assuming table row order (safer, since BOM's default sort isn't
+        guaranteed).
+      - widest_release: the highest theater count seen across ALL weekend
+        rows for this release. BOM's summary panel sometimes shows a
+        "Widest Release" field and sometimes omits it entirely (it seems
+        to disappear once a title has enough tracked history), so this is
+        computed directly from the weekend table instead, which is always
+        present and reliable.
 
     Returns an empty dict if the page or table can't be found/parsed.
     """
-    resp = _get(release_base_url + "weekend/")
+    resp = _get_with_retry(release_base_url + "weekend/")
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
     if not table:
         return {}
 
     best = None
+    widest_theaters_int, widest_theaters_str = None, None
+
     for row in table.find_all("tr")[1:]:
         cells = row.find_all("td")
         if len(cells) < 9:
             continue
+
+        theaters_str = cells[4].get_text(strip=True)
+        try:
+            theaters_int = int(theaters_str.replace(",", ""))
+        except ValueError:
+            theaters_int = None
+        if theaters_int is not None and (widest_theaters_int is None or theaters_int > widest_theaters_int):
+            widest_theaters_int = theaters_int
+            widest_theaters_str = theaters_str
+
         try:
             week_num = int(cells[8].get_text(strip=True).replace(",", ""))
         except ValueError:
@@ -348,7 +380,11 @@ def fetch_weekend_summary(release_base_url: str) -> dict:
                 "prev_weekend_date": sunday_date,
             }
 
-    return best or {}
+    if best is None:
+        return {}
+
+    best["widest_release"] = f"{widest_theaters_str} theaters" if widest_theaters_str else None
+    return best
 
 
 def fetch_daily_summary(release_base_url: str) -> dict:
@@ -363,7 +399,7 @@ def fetch_daily_summary(release_base_url: str) -> dict:
 
     Returns an empty dict if the page or table can't be found/parsed.
     """
-    resp = _get(release_base_url + "date/")
+    resp = _get_with_retry(release_base_url + "date/")
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
     if not table:
@@ -419,6 +455,9 @@ def parse_release_page(html: str) -> dict:
     h1 = soup.find("h1")
     if h1:
         title = h1.get_text(strip=True)
+        # BOM often renders the year directly attached to the title, e.g.
+        # "Gail Daughtry and the Celebrity Sex Pass(2026)" - strip it off.
+        title = re.sub(r"\(\d{4}\)\s*$", "", title).strip()
 
     # --- Release date + Domestic total ---
     domestic_row = _extract_domestic_release_row(soup)
@@ -496,13 +535,14 @@ def lookup_title(title: str) -> BoxOfficeResult:
         if parsed.get("release_group_url"):
             time.sleep(1)  # small politeness pause before the extra fetch
             try:
-                rg_page = _get(parsed["release_group_url"])
+                rg_page = _get_with_retry(parsed["release_group_url"])
                 precise_date = extract_domestic_date_from_release_group_page(rg_page.text)
                 if precise_date:
                     result.release_date = precise_date
-            except requests.exceptions.RequestException:
-                # Not fatal - just keep the rollout range we already have.
-                pass
+            except requests.exceptions.RequestException as e:
+                # Not fatal - just keep the rollout range we already have,
+                # but note it so partial failures aren't silently invisible.
+                result.error = f"release-group lookup failed: {e}"
 
         # Weekend + daily performance (mainly relevant for titles still in
         # theaters - both need a release_base_url, which comes from the
@@ -510,23 +550,27 @@ def lookup_title(title: str) -> BoxOfficeResult:
         if parsed.get("release_base_url"):
             base = parsed["release_base_url"]
 
-            time.sleep(1)
+            time.sleep(1.5)
             try:
                 weekend = fetch_weekend_summary(base)
                 result.weeks_in_theaters = weekend.get("weeks_in_theaters")
                 result.prev_weekend_gross = weekend.get("prev_weekend_gross")
                 result.prev_weekend_date = weekend.get("prev_weekend_date")
                 result.prev_weekend_theaters = weekend.get("prev_weekend_theaters")
-            except requests.exceptions.RequestException:
-                pass
+                # Prefer the computed max-theater-count value (reliable,
+                # always present when weekend data exists) over the
+                # summary-panel field (inconsistently present on BOM).
+                result.widest_release = weekend.get("widest_release") or result.widest_release
+            except requests.exceptions.RequestException as e:
+                result.error = f"weekend lookup failed: {e}"
 
-            time.sleep(1)
+            time.sleep(1.5)
             try:
                 daily = fetch_daily_summary(base)
                 result.last_recorded_date = daily.get("last_recorded_date")
                 result.last_recorded_gross = daily.get("last_recorded_gross")
-            except requests.exceptions.RequestException:
-                pass
+            except requests.exceptions.RequestException as e:
+                result.error = f"daily lookup failed: {e}"
 
     except requests.exceptions.RequestException as e:
         result.status = "error"
