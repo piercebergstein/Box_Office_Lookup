@@ -79,6 +79,7 @@ if run:
                     "Prev Weekend Theaters": r.prev_weekend_theaters or "",
                     "Last Recorded Date": r.last_recorded_date or "",
                     "Last Recorded Gross": r.last_recorded_gross or "",
+                    "Notes": "Retry - some fields may be incomplete" if r.error else "",
                     "BOM URL": r.url or "",
                 }
             )
