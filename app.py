@@ -25,12 +25,17 @@ st.write(
 with st.expander("Notes / limitations", expanded=False):
     st.markdown(
         """
-- This does a live web search + fetch for **each** title, so a list of 30 titles
-  will take roughly a minute (there's a polite delay between requests).
+- This does a live web search + fetch for **each** title, and for titles
+  still in theaters it now makes a few extra requests (weekend + daily
+  performance pages), so a list of 30 titles can take a few minutes.
 - If a title comes back as **not found**, try the most standard version of the
   name (e.g. drop "The" or a subtitle) - BOM's search can be picky about exact wording.
 - Domestic total reflects whatever BOM currently shows (lifetime-to-date for
   films still in theaters, final for completed runs).
+- **Weeks in Theaters**, **Prev Weekend** fields, and **Last Recorded**
+  fields are mainly meaningful for titles still actively tracking in
+  theaters. For older/completed titles these may come back blank - that's
+  expected, not a bug.
 - This is for personal / internal analysis. Box Office Mojo is an IMDb/Amazon
   property - don't hammer it with high request volume or redistribute scraped
   data commercially.
@@ -67,6 +72,13 @@ if run:
                     "Title": r.title or r.query,
                     "Release Date": r.release_date or "",
                     "Domestic Box Office": r.domestic_total or "",
+                    "Widest Release": r.widest_release or "",
+                    "Weeks in Theaters": r.weeks_in_theaters or "",
+                    "Prev Weekend Gross": r.prev_weekend_gross or "",
+                    "Prev Weekend Date": r.prev_weekend_date or "",
+                    "Prev Weekend Theaters": r.prev_weekend_theaters or "",
+                    "Last Recorded Date": r.last_recorded_date or "",
+                    "Last Recorded Gross": r.last_recorded_gross or "",
                     "BOM URL": r.url or "",
                 }
             )
