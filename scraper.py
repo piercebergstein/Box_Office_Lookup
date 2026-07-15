@@ -166,7 +166,7 @@ def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
     return {"release_date": release_date, "domestic_total": domestic_total}
 
 
-def _extract_by_release_rollout(soup: BeautifulSoup) -> Optional[str]:
+def _extract_by_release_info(soup: BeautifulSoup) -> dict:
     """
     Fallback for titles that don't have a clean per-region "Domestic" table
     (common on older titles, or ones that opened limited-then-wide rather
@@ -175,14 +175,19 @@ def _extract_by_release_rollout(soup: BeautifulSoup) -> Optional[str]:
         <h3>By Release</h3>
         <table>
           <tr><th>Release Group</th><th>Rollout</th><th>Markets</th>...</tr>
-          <tr><td>Original Release</td><td>August 19-January 1, 2010</td>...</tr>
+          <tr><td><a href="/releasegroup/grXXXXXXXXXX/">Original Release</a></td>
+              <td>August 19-January 1, 2010</td>...</tr>
         </table>
 
-    Returns the "Rollout" value from the first data row (the original
-    release, as opposed to any later re-release rows). Note this can be a
-    date *range* rather than a single date, since it reflects a limited-to-
-    wide rollout rather than a simultaneous release.
+    Returns both:
+      - "rollout": the date *range* from the Rollout column (reflects a
+        limited-to-wide rollout rather than a single release date)
+      - "release_group_url": the link behind "Original Release", which
+        leads to a page with the actual single domestic release date
+        (see `extract_domestic_date_from_release_group_page` below)
     """
+    rollout, release_group_url = None, None
+
     for h3 in soup.find_all("h3"):
         if h3.get_text(strip=True).lower() != "by release":
             continue
@@ -194,13 +199,60 @@ def _extract_by_release_rollout(soup: BeautifulSoup) -> Optional[str]:
             continue
 
         header_cells = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th", "td"])]
-        if "rollout" not in header_cells:
-            continue
-        rollout_idx = header_cells.index("rollout")
-
         data_cells = rows[1].find_all("td")
-        if len(data_cells) > rollout_idx:
-            return data_cells[rollout_idx].get_text(" ", strip=True)
+
+        if "rollout" in header_cells:
+            rollout_idx = header_cells.index("rollout")
+            if len(data_cells) > rollout_idx:
+                rollout = data_cells[rollout_idx].get_text(" ", strip=True)
+
+        # First data row's first cell is normally "Release Group" with a
+        # link to the Original Release's own page.
+        if data_cells:
+            link = data_cells[0].find("a")
+            if link and link.get("href"):
+                href = link["href"]
+                release_group_url = BASE_URL + href if href.startswith("/") else href
+        break
+
+    return {"rollout": rollout, "release_group_url": release_group_url}
+
+
+def extract_domestic_date_from_release_group_page(html: str) -> Optional[str]:
+    """
+    Parses a Box Office Mojo /releasegroup/grXXXXXXXXXX/ page (reached via
+    the "Original Release" link) to find the single, clean domestic release
+    date. These pages structure the regional breakdown a bit differently
+    than title pages - each region is its own table with a colspan header
+    row instead of a preceding <h3>:
+
+        <table class="... releases-by-region">
+          <tr><th colspan="4">Domestic</th></tr>
+          <tr><th>Market</th><th>Release Date</th><th>Opening</th><th>Gross</th></tr>
+          <tr><td>Domestic</td><td>Aug 21, 2009</td><td>...</td><td>...</td></tr>
+        </table>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for th in soup.find_all("th", attrs={"colspan": True}):
+        if th.get_text(strip=True).lower() != "domestic":
+            continue
+        table = th.find_parent("table")
+        if not table:
+            continue
+        rows = table.find_all("tr")
+        if len(rows) < 3:
+            continue
+
+        header_cells = [c.get_text(strip=True).lower() for c in rows[1].find_all(["th", "td"])]
+        if "release date" not in header_cells:
+            continue
+        date_idx = header_cells.index("release date")
+
+        data_cells = rows[2].find_all("td")
+        if len(data_cells) > date_idx:
+            value = data_cells[date_idx].get_text(" ", strip=True)
+            return value or None
         break
 
     return None
@@ -243,14 +295,18 @@ def parse_release_page(html: str) -> dict:
     if domestic_total is None:
         domestic_total = domestic_row["domestic_total"]
 
-    # Fallback 1: older / limited-then-wide titles often lack the clean
-    # per-region "Domestic" table above, but have a "By Release" rollout
-    # table instead.
+    # Fallback for release date: older / limited-then-wide titles often
+    # lack the clean per-region "Domestic" table above, but have a
+    # "By Release" table instead, plus a link to a release-group page with
+    # a precise single date (the caller follows this - see lookup_title).
+    release_group_url = None
     if release_date is None:
-        release_date = _extract_by_release_rollout(soup)
+        by_release = _extract_by_release_info(soup)
+        release_date = by_release["rollout"]
+        release_group_url = by_release["release_group_url"]
 
-    # Fallback 2: if nothing above found a domestic total, fall back to the
-    # first "money" span on the page (typically the domestic lifetime
+    # Fallback for domestic total: if nothing above found one, fall back to
+    # the first "money" span on the page (typically the domestic lifetime
     # total in the summary table).
     if domestic_total is None:
         money_spans = soup.select("span.money")
@@ -261,6 +317,7 @@ def parse_release_page(html: str) -> dict:
         "title": title,
         "release_date": release_date,
         "domestic_total": domestic_total,
+        "release_group_url": release_group_url,
     }
 
 
@@ -287,6 +344,20 @@ def lookup_title(title: str) -> BoxOfficeResult:
         result.release_date = parsed["release_date"]
         result.domestic_total = parsed["domestic_total"]
         result.status = "ok"
+
+        # If we only got a rollout date *range* (not a single clean date),
+        # follow the "Original Release" link to the release-group page,
+        # which has the actual single domestic release date.
+        if parsed.get("release_group_url"):
+            time.sleep(1)  # small politeness pause before the extra fetch
+            try:
+                rg_page = _get(parsed["release_group_url"])
+                precise_date = extract_domestic_date_from_release_group_page(rg_page.text)
+                if precise_date:
+                    result.release_date = precise_date
+            except requests.exceptions.RequestException:
+                # Not fatal - just keep the rollout range we already have.
+                pass
 
     except requests.exceptions.RequestException as e:
         result.status = "error"
