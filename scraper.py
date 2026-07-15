@@ -20,6 +20,7 @@ Design notes:
 
 import re
 import time
+import datetime
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -61,6 +62,13 @@ class BoxOfficeResult:
     title: Optional[str] = None    # title as found on BOM
     release_date: Optional[str] = None
     domestic_total: Optional[str] = None
+    widest_release: Optional[str] = None
+    weeks_in_theaters: Optional[str] = None
+    prev_weekend_gross: Optional[str] = None
+    prev_weekend_date: Optional[str] = None
+    prev_weekend_theaters: Optional[str] = None
+    last_recorded_date: Optional[str] = None
+    last_recorded_gross: Optional[str] = None
     url: Optional[str] = None
     status: str = "not_found"      # "ok" | "not_found" | "error"
     error: Optional[str] = None
@@ -137,16 +145,19 @@ def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
         <h3>Domestic</h3>
         <table>
           <tr><th>Area</th><th>Release Date</th><th>Opening</th><th>Gross</th></tr>
-          <tr><td>Domestic</td><td>Jul 21, 2023</td><td>$82,455,420</td><td>$330,078,895</td></tr>
+          <tr><td><a href="/release/rlXXXXXXXXX/?...">Domestic</a></td>
+              <td>Jul 21, 2023</td><td>$82,455,420</td><td>$330,078,895</td></tr>
         </table>
 
-    This is the authoritative source for both the domestic release date
-    and the domestic lifetime gross, and pulling them from the same row
-    avoids accidentally grabbing an unrelated date (BOM also lists an
-    "Earliest Release Date" elsewhere on the page, which can reflect an
-    international release instead of the domestic one).
+    This is the authoritative source for the domestic release date, the
+    domestic lifetime gross, AND the base release URL (used to reach the
+    title's own weekend/daily performance tables - see
+    `fetch_weekend_summary` / `fetch_daily_summary` below). Pulling date +
+    gross from the same row avoids accidentally grabbing an unrelated date
+    (BOM also lists an "Earliest Release Date" elsewhere on the page, which
+    can reflect an international release instead of the domestic one).
     """
-    release_date, domestic_total = None, None
+    release_date, domestic_total, release_base_url = None, None, None
 
     for h3 in soup.find_all("h3"):
         if h3.get_text(strip=True).lower() != "domestic":
@@ -161,9 +172,36 @@ def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
         if len(cells) >= 4:
             release_date = cells[1].get_text(" ", strip=True)
             domestic_total = cells[3].get_text(strip=True)
+            link = cells[0].find("a")
+            if link and link.get("href"):
+                href = link["href"].split("?")[0]
+                if href.startswith("/"):
+                    href = BASE_URL + href
+                if not href.endswith("/"):
+                    href += "/"
+                release_base_url = href
         break
 
-    return {"release_date": release_date, "domestic_total": domestic_total}
+    return {
+        "release_date": release_date,
+        "domestic_total": domestic_total,
+        "release_base_url": release_base_url,
+    }
+
+
+def _extract_summary_label_value(soup: BeautifulSoup, label: str) -> Optional[str]:
+    """
+    Generic reader for simple label/value rows in the summary panel, e.g.:
+        <div class="a-section a-spacing-none">
+            <span>Widest Release</span><span>1,000 theaters</span>
+        </div>
+    Matches on exact label text (case-insensitive).
+    """
+    for div in soup.select("div.a-section.a-spacing-none"):
+        spans = div.find_all("span", recursive=False)
+        if len(spans) == 2 and spans[0].get_text(strip=True).lower() == label.lower():
+            return spans[1].get_text(" ", strip=True)
+    return None
 
 
 def _extract_by_release_info(soup: BeautifulSoup) -> dict:
@@ -258,6 +296,107 @@ def extract_domestic_date_from_release_group_page(html: str) -> Optional[str]:
     return None
 
 
+def fetch_weekend_summary(release_base_url: str) -> dict:
+    """
+    Fetches <release_base_url>weekend/ and returns stats for the most
+    recent weekend on record - determined by picking the row with the
+    highest week number, not by assuming table row order (safer, since
+    BOM's default sort isn't guaranteed):
+
+      - weeks_in_theaters: the week-of-release number (e.g. "1", "12")
+      - prev_weekend_gross: that weekend's gross
+      - prev_weekend_theaters: theater count that weekend
+      - prev_weekend_date: the Sunday of that weekend, computed from the
+        page's ISO-week URL encoding (e.g. /weekend/2026W28/) rather than
+        parsed from the "Jul 10-12" display text, which is ambiguous when
+        a weekend spans two months.
+
+    Returns an empty dict if the page or table can't be found/parsed.
+    """
+    resp = _get(release_base_url + "weekend/")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return {}
+
+    best = None
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all("td")
+        if len(cells) < 9:
+            continue
+        try:
+            week_num = int(cells[8].get_text(strip=True).replace(",", ""))
+        except ValueError:
+            continue
+
+        sunday_date = None
+        link = cells[0].find("a")
+        if link and link.get("href"):
+            m = re.search(r"/weekend/(\d{4})W(\d+)/", link["href"])
+            if m:
+                year, week = int(m.group(1)), int(m.group(2))
+                try:
+                    sunday_date = datetime.date.fromisocalendar(year, week, 7).strftime("%b %d, %Y")
+                except ValueError:
+                    pass
+
+        if best is None or week_num > best["weeks_in_theaters"]:
+            best = {
+                "weeks_in_theaters": week_num,
+                "prev_weekend_gross": cells[2].get_text(strip=True),
+                "prev_weekend_theaters": cells[4].get_text(strip=True),
+                "prev_weekend_date": sunday_date,
+            }
+
+    return best or {}
+
+
+def fetch_daily_summary(release_base_url: str) -> dict:
+    """
+    Fetches <release_base_url>date/ and returns the most recently recorded
+    day's figures - determined by parsing each row's actual encoded date
+    (from its link, e.g. /date/2026-07-12/) and taking the max, rather than
+    assuming table row order:
+
+      - last_recorded_date
+      - last_recorded_gross (that single day's gross, not cumulative)
+
+    Returns an empty dict if the page or table can't be found/parsed.
+    """
+    resp = _get(release_base_url + "date/")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return {}
+
+    best = None
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all("td")
+        if len(cells) < 4:
+            continue
+        link = cells[0].find("a")
+        if not (link and link.get("href")):
+            continue
+        m = re.search(r"/date/(\d{4}-\d{2}-\d{2})/", link["href"])
+        if not m:
+            continue
+        try:
+            date_obj = datetime.datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        if best is None or date_obj > best["_date_obj"]:
+            best = {
+                "_date_obj": date_obj,
+                "last_recorded_date": date_obj.strftime("%b %d, %Y"),
+                "last_recorded_gross": cells[3].get_text(strip=True),
+            }
+
+    if best:
+        best.pop("_date_obj", None)
+    return best or {}
+
+
 def parse_release_page(html: str) -> dict:
     """
     Parse a Box Office Mojo /release/rlXXXXXXXXXX/ page.
@@ -313,11 +452,16 @@ def parse_release_page(html: str) -> dict:
         if money_spans:
             domestic_total = money_spans[0].get_text(strip=True)
 
+    # --- Widest Release ---
+    widest_release = _extract_summary_label_value(soup, "Widest Release")
+
     return {
         "title": title,
         "release_date": release_date,
         "domestic_total": domestic_total,
+        "widest_release": widest_release,
         "release_group_url": release_group_url,
+        "release_base_url": domestic_row["release_base_url"],
     }
 
 
@@ -343,6 +487,7 @@ def lookup_title(title: str) -> BoxOfficeResult:
         result.title = parsed["title"] or bom_title
         result.release_date = parsed["release_date"]
         result.domestic_total = parsed["domestic_total"]
+        result.widest_release = parsed["widest_release"]
         result.status = "ok"
 
         # If we only got a rollout date *range* (not a single clean date),
@@ -357,6 +502,30 @@ def lookup_title(title: str) -> BoxOfficeResult:
                     result.release_date = precise_date
             except requests.exceptions.RequestException:
                 # Not fatal - just keep the rollout range we already have.
+                pass
+
+        # Weekend + daily performance (mainly relevant for titles still in
+        # theaters - both need a release_base_url, which comes from the
+        # "Domestic" table on the main page).
+        if parsed.get("release_base_url"):
+            base = parsed["release_base_url"]
+
+            time.sleep(1)
+            try:
+                weekend = fetch_weekend_summary(base)
+                result.weeks_in_theaters = weekend.get("weeks_in_theaters")
+                result.prev_weekend_gross = weekend.get("prev_weekend_gross")
+                result.prev_weekend_date = weekend.get("prev_weekend_date")
+                result.prev_weekend_theaters = weekend.get("prev_weekend_theaters")
+            except requests.exceptions.RequestException:
+                pass
+
+            time.sleep(1)
+            try:
+                daily = fetch_daily_summary(base)
+                result.last_recorded_date = daily.get("last_recorded_date")
+                result.last_recorded_gross = daily.get("last_recorded_gross")
+            except requests.exceptions.RequestException:
                 pass
 
     except requests.exceptions.RequestException as e:
