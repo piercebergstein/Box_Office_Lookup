@@ -401,17 +401,21 @@ def fetch_weekend_summary(release_base_url: str) -> dict:
 
 def fetch_daily_summary(release_base_url: str) -> dict:
     """
-    Fetches <release_base_url>date/ and returns the most recently recorded
-    day's figures - determined by parsing each row's actual encoded date
-    (from its link, e.g. /date/2026-07-12/) and taking the max, rather than
-    assuming table row order:
+    Fetches <release_base_url> itself (the base release page - BOM embeds
+    the title's own daily performance table directly there under a
+    "Domestic Daily" tab; there is no separate /date/ sub-path for a
+    title's own daily data, unlike the /weekend/ sub-path which does
+    exist). Returns the most recently recorded day's figures - determined
+    by parsing each row's actual encoded date (from its link, e.g.
+    /date/2026-07-12/) and taking the max, rather than assuming table row
+    order:
 
       - last_recorded_date
       - last_recorded_gross (that single day's gross, not cumulative)
 
     Returns an empty dict if the page or table can't be found/parsed.
     """
-    resp = _get_with_retry(release_base_url + "date/")
+    resp = _get_with_retry(release_base_url)
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
     if not table:
@@ -587,6 +591,7 @@ def lookup_title(title: str) -> BoxOfficeResult:
                 # Not fatal - just keep the rollout range we already have,
                 # but note it so partial failures aren't silently invisible.
                 result.error = f"release-group lookup failed: {e}"
+                logger.warning(f"[{title}] release-group lookup failed: {type(e).__name__}: {e}")
 
         # Weekend + daily performance (mainly relevant for titles still in
         # theaters - both need a release_base_url, which comes from the
@@ -607,6 +612,7 @@ def lookup_title(title: str) -> BoxOfficeResult:
                 result.widest_release = weekend.get("widest_release") or result.widest_release
             except requests.exceptions.RequestException as e:
                 result.error = f"weekend lookup failed: {e}"
+                logger.warning(f"[{title}] weekend lookup failed: {type(e).__name__}: {e}")
 
             time.sleep(2)
             try:
@@ -615,6 +621,8 @@ def lookup_title(title: str) -> BoxOfficeResult:
                 result.last_recorded_gross = daily.get("last_recorded_gross")
             except requests.exceptions.RequestException as e:
                 result.error = f"daily lookup failed: {e}"
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                logger.warning(f"[{title}] daily lookup failed: {type(e).__name__}: {e} (status={status_code})")
 
     except requests.exceptions.RequestException as e:
         result.status = "error"
