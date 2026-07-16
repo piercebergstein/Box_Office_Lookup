@@ -18,8 +18,9 @@ st.set_page_config(page_title="Box Office Mojo Lookup", page_icon="\U0001F3AC", 
 
 st.title("\U0001F3AC Box Office Mojo Lookup")
 st.write(
-    "Paste a list of movie titles (one per line). This will look each one up on "
-    "Box Office Mojo and return the title, release date, and domestic box office total."
+    "Paste a list of movie titles, IMDb tt-codes, or Box Office Mojo URLs (one per line). "
+    "This will look each one up on Box Office Mojo and return the title, release date, "
+    "domestic box office, and more."
 )
 
 with st.expander("Notes / limitations", expanded=False):
@@ -28,14 +29,17 @@ with st.expander("Notes / limitations", expanded=False):
 - This does a live web search + fetch for **each** title, and for titles
   still in theaters it now makes a few extra requests (weekend + daily
   performance pages), so a list of 30 titles can take a few minutes.
-- If a title comes back as **not found**, try the most standard version of the
-  name (e.g. drop "The" or a subtitle) - BOM's search can be picky about exact wording.
-- Domestic total reflects whatever BOM currently shows (lifetime-to-date for
-  films still in theaters, final for completed runs).
+- If a title comes back as **not found**, or matches the wrong film,
+  try pasting its **IMDb tt-code** or full Box Office Mojo URL instead -
+  this skips BOM's search entirely and goes straight to the right page,
+  which is faster and more reliable for generic or ambiguous titles.
+- **Domestic Box Office** shows **$0** for titles that were never released
+  in U.S. theaters (international-only releases) rather than showing a
+  worldwide/international figure by mistake.
 - **Weeks in Theaters**, **Prev Weekend** fields, and **Last Recorded**
   fields are mainly meaningful for titles still actively tracking in
-  theaters. For older/completed titles these may come back blank - that's
-  expected, not a bug.
+  theaters. For older/completed or international-only titles these may
+  come back blank - that's expected, not a bug.
 - This is for personal / internal analysis. Box Office Mojo is an IMDb/Amazon
   property - don't hammer it with high request volume or redistribute scraped
   data commercially.
@@ -43,9 +47,9 @@ with st.expander("Notes / limitations", expanded=False):
     )
 
 titles_input = st.text_area(
-    "Titles (one per line)",
+    "Titles, tt-codes, or BOM URLs (one per line)",
     height=200,
-    placeholder="Oppenheimer\nBarbie\nDune: Part Two",
+    placeholder="Oppenheimer\ntt15398776\nhttps://www.boxofficemojo.com/title/tt32141377/",
 )
 
 col1, col2 = st.columns([1, 3])
@@ -79,7 +83,6 @@ if run:
                     "Prev Weekend Theaters": r.prev_weekend_theaters or "",
                     "Last Recorded Date": r.last_recorded_date or "",
                     "Last Recorded Gross": r.last_recorded_gross or "",
-                    "Notes": "Retry - some fields may be incomplete" if r.error else "",
                     "BOM URL": r.url or "",
                 }
             )
@@ -88,10 +91,11 @@ if run:
         st.success(f"Done - {sum(1 for r in results if r.status == 'ok')} of {len(results)} found.")
         st.dataframe(df, use_container_width=True)
 
+        import datetime as _dt
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download as CSV",
             data=csv,
-            file_name="box_office_results.csv",
+            file_name=f"BO Mojo Lookup {_dt.date.today().isoformat()}.csv",
             mime="text/csv",
         )
