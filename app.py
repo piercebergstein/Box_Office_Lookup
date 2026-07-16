@@ -74,16 +74,16 @@ if run:
             rows.append(
                 {
                     "Title": r.title or r.query,
-                    "Release Date": r.release_date or "",
-                    "Domestic Box Office": r.domestic_total or "",
-                    "Widest Release": r.widest_release or "",
-                    "Weeks in Theaters": r.weeks_in_theaters or "",
-                    "Prev Weekend Gross": r.prev_weekend_gross or "",
-                    "Prev Weekend Date": r.prev_weekend_date or "",
-                    "Prev Weekend Theaters": r.prev_weekend_theaters or "",
-                    "Last Recorded Date": r.last_recorded_date or "",
-                    "Last Recorded Gross": r.last_recorded_gross or "",
-                    "BOM URL": r.url or "",
+                    "Release Date": r.release_date or "N/A",
+                    "Domestic Box Office": r.domestic_total or "N/A",
+                    "Widest Release": r.widest_release or "N/A",
+                    "Weeks in Theaters": r.weeks_in_theaters or "N/A",
+                    "Prev Weekend Gross": r.prev_weekend_gross or "N/A",
+                    "Prev Weekend Date": r.prev_weekend_date or "N/A",
+                    "Prev Weekend Theaters": r.prev_weekend_theaters or "N/A",
+                    "Last Recorded Date": r.last_recorded_date or "N/A",
+                    "Last Recorded Gross": r.last_recorded_gross or "N/A",
+                    "BOM URL": r.url or "N/A",
                 }
             )
 
