@@ -74,8 +74,17 @@ class BoxOfficeResult:
     error: Optional[str] = None
 
 
+# A persistent session (rather than one-off requests.get calls) so cookies
+# carry across the several requests made per title - closer to how an
+# actual browser behaves when navigating from page to page on the same
+# site, and less likely to look automated to bot-detection systems that
+# watch for repeated cold/cookie-less requests in quick succession.
+_session = requests.Session()
+_session.headers.update(HEADERS)
+
+
 def _get(url: str) -> requests.Response:
-    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp = _session.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp
 
@@ -177,10 +186,12 @@ def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
     can reflect an international release instead of the domestic one).
     """
     release_date, domestic_total, release_base_url = None, None, None
+    domestic_section_found = False
 
     for h3 in soup.find_all("h3"):
         if h3.get_text(strip=True).lower() != "domestic":
             continue
+        domestic_section_found = True
         table = h3.find_next("table")
         if not table:
             continue
@@ -204,6 +215,7 @@ def _extract_domestic_release_row(soup: BeautifulSoup) -> dict:
     return {
         "release_date": release_date,
         "domestic_total": domestic_total,
+        "domestic_section_found": domestic_section_found,
         "release_base_url": release_base_url,
     }
 
@@ -383,7 +395,7 @@ def fetch_weekend_summary(release_base_url: str) -> dict:
     if best is None:
         return {}
 
-    best["widest_release"] = f"{widest_theaters_str} theaters" if widest_theaters_str else None
+    best["widest_release"] = widest_theaters_str
     return best
 
 
@@ -462,37 +474,55 @@ def parse_release_page(html: str) -> dict:
     # --- Release date + Domestic total ---
     domestic_row = _extract_domestic_release_row(soup)
     release_date = domestic_row["release_date"]
-
-    # Domestic total priority:
-    #  1. Top "All Releases" summary box - most current, especially for
-    #     titles still actively tracking new box office day to day.
-    #  2. Per-region "Domestic" table's Gross column - can lag behind #1
-    #     for very recent/still-running titles.
-    #  3. First "money" span on the page - last-resort fallback.
-    domestic_total = _extract_summary_box_domestic_total(soup)
-    if domestic_total is None:
-        domestic_total = domestic_row["domestic_total"]
+    domestic_section_found = domestic_row["domestic_section_found"]
 
     # Fallback for release date: older / limited-then-wide titles often
     # lack the clean per-region "Domestic" table above, but have a
     # "By Release" table instead, plus a link to a release-group page with
     # a precise single date (the caller follows this - see lookup_title).
     release_group_url = None
+    by_release_found = False
     if release_date is None:
         by_release = _extract_by_release_info(soup)
+        if by_release["rollout"] or by_release["release_group_url"]:
+            by_release_found = True
         release_date = by_release["rollout"]
         release_group_url = by_release["release_group_url"]
 
-    # Fallback for domestic total: if nothing above found one, fall back to
-    # the first "money" span on the page (typically the domestic lifetime
-    # total in the summary table).
-    if domestic_total is None:
-        money_spans = soup.select("span.money")
-        if money_spans:
-            domestic_total = money_spans[0].get_text(strip=True)
+    # A domestic release exists if we found either a "Domestic" per-region
+    # table OR a "By Release" rollout table (used by older titles). If
+    # neither is present, this title was never released in U.S. theaters -
+    # some BOM pages only list international regions (e.g. "Asia Pacific",
+    # "Europe, Middle East, and Africa") with no "Domestic" section at all.
+    has_domestic_release = domestic_section_found or by_release_found
+
+    if has_domestic_release:
+        # Domestic total priority:
+        #  1. Top "All Releases" summary box - most current, especially for
+        #     titles still actively tracking new box office day to day.
+        #  2. Per-region "Domestic" table's Gross column - can lag behind #1
+        #     for very recent/still-running titles.
+        #  3. First "money" span on the page - last-resort fallback.
+        domestic_total = _extract_summary_box_domestic_total(soup)
+        if domestic_total is None:
+            domestic_total = domestic_row["domestic_total"]
+        if domestic_total is None:
+            money_spans = soup.select("span.money")
+            if money_spans:
+                domestic_total = money_spans[0].get_text(strip=True)
+    else:
+        # No domestic release anywhere on the page - default to $0 rather
+        # than falling back to an international/worldwide figure, which is
+        # what the old logic used to do by mistake.
+        domestic_total = "$0"
 
     # --- Widest Release ---
+    # (fallback only - the weekend-table-derived value in lookup_title takes
+    # priority since it's more reliable; this is just used when that isn't
+    # available, e.g. no release_base_url was found)
     widest_release = _extract_summary_label_value(soup, "Widest Release")
+    if widest_release:
+        widest_release = re.sub(r"\s*theaters?\s*$", "", widest_release, flags=re.IGNORECASE).strip()
 
     return {
         "title": title,
@@ -509,15 +539,29 @@ def lookup_title(title: str) -> BoxOfficeResult:
     Full pipeline for a single title: search -> fetch -> parse.
     Never raises - errors are captured on the result object so batch runs
     don't die on one bad title.
+
+    Accepts either:
+      - A plain title string, e.g. "Oppenheimer" (goes through BOM search,
+        which can occasionally mismatch on generic/ambiguous titles)
+      - An IMDb tt-code, bare (e.g. "tt15398776") or embedded in a pasted
+        BOM URL (e.g. "https://www.boxofficemojo.com/title/tt15398776/...")
+        - this goes straight to the title page and skips search entirely,
+        which is both faster and more reliable when you already know the
+        exact title BOM has on file.
     """
     result = BoxOfficeResult(query=title)
     try:
-        found = find_release_url(title)
-        if not found:
-            result.status = "not_found"
-            return result
+        tt_match = re.search(r"(tt\d{7,9})", title, re.IGNORECASE)
+        bom_title = None
+        if tt_match:
+            url = f"{BASE_URL}/title/{tt_match.group(1).lower()}/"
+        else:
+            found = find_release_url(title)
+            if not found:
+                result.status = "not_found"
+                return result
+            bom_title, url = found
 
-        bom_title, url = found
         result.url = url
 
         page = _get(url)
@@ -564,7 +608,7 @@ def lookup_title(title: str) -> BoxOfficeResult:
             except requests.exceptions.RequestException as e:
                 result.error = f"weekend lookup failed: {e}"
 
-            time.sleep(1.5)
+            time.sleep(2)
             try:
                 daily = fetch_daily_summary(base)
                 result.last_recorded_date = daily.get("last_recorded_date")
