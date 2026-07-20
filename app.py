@@ -74,6 +74,7 @@ if run:
             rows.append(
                 {
                     "Title": r.title or r.query,
+                    "tt Code": r.tt_code or "N/A",
                     "Release Date": r.release_date or "N/A",
                     "Domestic Box Office": r.domestic_total or "N/A",
                     "Widest Release": r.widest_release or "N/A",
