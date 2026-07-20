@@ -60,6 +60,7 @@ DELAY_BETWEEN_REQUESTS = 1.5  # seconds - be polite, don't hammer the site
 class BoxOfficeResult:
     query: str                     # what you searched for
     title: Optional[str] = None    # title as found on BOM
+    tt_code: Optional[str] = None  # IMDb tt-code, e.g. "tt15398776"
     release_date: Optional[str] = None
     domestic_total: Optional[str] = None
     widest_release: Optional[str] = None
@@ -528,8 +529,16 @@ def parse_release_page(html: str) -> dict:
     if widest_release:
         widest_release = re.sub(r"\s*theaters?\s*$", "", widest_release, flags=re.IGNORECASE).strip()
 
+    # --- IMDb tt-code ---
+    # Appears reliably in pro.imdb.com links and/or the release-group
+    # dropdown value on every page template we've seen (title page,
+    # release page, release-group page).
+    tt_match = re.search(r"/title/(tt\d{7,9})", html)
+    tt_code = tt_match.group(1) if tt_match else None
+
     return {
         "title": title,
+        "tt_code": tt_code,
         "release_date": release_date,
         "domestic_total": domestic_total,
         "widest_release": widest_release,
@@ -572,6 +581,9 @@ def lookup_title(title: str) -> BoxOfficeResult:
         parsed = parse_release_page(page.text)
 
         result.title = parsed["title"] or bom_title
+        # Prefer the tt-code found on the page itself; fall back to the one
+        # the user typed in (if they searched by tt-code/URL) as a safety net.
+        result.tt_code = parsed["tt_code"] or (tt_match.group(1).lower() if tt_match else None)
         result.release_date = parsed["release_date"]
         result.domestic_total = parsed["domestic_total"]
         result.widest_release = parsed["widest_release"]
